@@ -1,258 +1,163 @@
 import os
-import tempfile
-import threading
 import logging
-from typing import Optional, List, Dict, Any
-import asyncio
-
-# Third-party imports
-from flask import Flask, jsonify
+from threading import Thread
+from flask import Flask
+from pytube import YouTube, exceptions as PytubeExceptions
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from pytube import YouTube
+from telegram.constants import ParseMode
 
-# Configure logging
+# === Logging Setup: Behtar debugging ke liye ===
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Flask app for uptime monitoring
+# === Configuration ===
+try:
+    TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+    # 50 MB limit in bytes
+    MAX_FILE_SIZE = 50 * 1024 * 1024 
+except KeyError:
+    logger.critical("FATAL ERROR: TELEGRAM_BOT_TOKEN environment variable nahi mila!")
+    # Agar token nahi mila to program band ho jayega.
+    exit()
+
+# === Flask Web App (Bot ko Zinda Rakhne ke liye) ===
 app = Flask(__name__)
 
 @app.route('/')
-def status():
-    """Root endpoint showing bot status."""
-    return "Bot is Alive"
+def home():
+    """Web page jo bot ka status dikhata hai."""
+    return "<h1>Bot is Alive!</h1><p>Aapka YouTube downloader bot chal raha hai.</p>"
 
 @app.route('/ping')
 def ping():
-    """Ping endpoint for uptime monitoring."""
+    """UptimeRobot is endpoint ko ping karega."""
     return "pong"
 
-class YouTubeDownloader:
-    """Handles YouTube video downloading and processing."""
-    
-    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB in bytes
-    
-    @staticmethod
-    def get_video_info(url: str) -> Optional[YouTube]:
-        """Get YouTube video object from URL."""
-        try:
-            yt = YouTube(url)
-            return yt
-        except Exception as e:
-            logger.error(f"Error getting video info: {e}")
-            return None
-    
-    @staticmethod
-    def get_progressive_streams(yt: YouTube) -> List[Dict[str, Any]]:
-        """Get progressive mp4 streams under size limit."""
-        try:
-            streams = yt.streams.filter(progressive=True, file_extension='mp4')
-            valid_streams = []
-            
-            for stream in streams:
-                # Get file size
-                file_size = stream.filesize
-                if file_size and file_size <= YouTubeDownloader.MAX_FILE_SIZE:
-                    valid_streams.append({
-                        'itag': stream.itag,
-                        'resolution': stream.resolution,
-                        'fps': stream.fps,
-                        'filesize': file_size,
-                        'stream': stream
-                    })
-            
-            # Sort by resolution (descending)
-            valid_streams.sort(key=lambda x: int(x['resolution'].replace('p', '')) if x['resolution'] else 0, reverse=True)
-            return valid_streams
-            
-        except Exception as e:
-            logger.error(f"Error getting streams: {e}")
-            return []
-    
-    @staticmethod
-    def download_stream(stream, temp_dir: str) -> Optional[str]:
-        """Download stream to temporary directory."""
-        try:
-            file_path = stream.download(output_path=temp_dir)
-            return file_path
-        except Exception as e:
-            logger.error(f"Error downloading stream: {e}")
-            return None
+def run_flask():
+    """Flask app ko ek alag thread mein chalata hai."""
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
-class TelegramBot:
-    """Telegram bot for YouTube video downloads."""
-    
-    def __init__(self, token: str):
-        self.token = token
-        self.application = Application.builder().token(token).build()
-        self.downloader = YouTubeDownloader()
-        self._setup_handlers()
-    
-    def _setup_handlers(self):
-        """Setup bot command and message handlers."""
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command."""
-        welcome_message = (
-            "🎥 *YouTube Downloader Bot*\n\n"
-            "Send me a YouTube URL and I'll help you download it!\n\n"
-            "Features:\n"
-            "• Progressive MP4 downloads only\n"
-            "• 50 MB file size limit\n"
-            "• Quality selection\n\n"
-            "Just send me any YouTube link to get started!"
-        )
-        await update.message.reply_text(welcome_message, parse_mode='Markdown')
-    
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command."""
-        help_message = (
-            "🔗 *How to use:*\n\n"
-            "1. Send me a YouTube URL\n"
-            "2. Choose your preferred quality\n"
-            "3. Wait for the download to complete\n"
-            "4. Receive your video file!\n\n"
-            "*Limitations:*\n"
-            "• Maximum file size: 50 MB\n"
-            "• Progressive MP4 streams only\n"
-            "• One video at a time\n\n"
-            "If you encounter any issues, make sure the YouTube URL is valid and the video is available."
-        )
-        await update.message.reply_text(help_message, parse_mode='Markdown')
-    
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming text messages (YouTube URLs)."""
-        message_text = update.message.text.strip()
-        
-        # Check if message contains YouTube URL
-        if not self._is_youtube_url(message_text):
-            await update.message.reply_text(
-                "❌ Please send a valid YouTube URL.\n\n"
-                "Supported formats:\n"
-                "• https://www.youtube.com/watch?v=VIDEO_ID\n"
-                "• https://youtu.be/VIDEO_ID\n"
-                "• https://m.youtube.com/watch?v=VIDEO_ID"
-            )
-            return
-        
-        # Show processing message
-        processing_msg = await update.message.reply_text("🔍 Processing YouTube URL...")
+# === Telegram Bot Logic ===
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start command ke liye handler."""
+    user = update.effective_user
+    welcome_text = (
+        f"Salaam, {user.mention_html()}!\n\n"
+        "Main ek YouTube Downloader Bot hoon. Muje koi bhi YouTube video ka link bhejein.\n\n"
+        "<b>Note:</b> Main sirf 50 MB se choti video files hi bhej sakta hoon."
+    )
+    await update.message.reply_html(welcome_text)
+
+async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """YouTube links ko process karta hai."""
+    message_text = update.message.text
+    if "youtube.com/" in message_text or "youtu.be/" in message_text:
+        sent_message = await update.message.reply_text("⏳ Link process ho raha hai, कृपया प्रतीक्षा करें...")
         
         try:
-            # Get video info
-            yt = self.downloader.get_video_info(message_text)
-            if not yt:
-                await processing_msg.edit_text("❌ Failed to get video information. Please check the URL and try again.")
-                return
+            yt = YouTube(message_text)
             
-            # Get available streams
-            streams = self.downloader.get_progressive_streams(yt)
-            if not streams:
-                await processing_msg.edit_text(
-                    "❌ No suitable video streams found.\n\n"
-                    "This could be because:\n"
-                    "• All available qualities exceed 50 MB\n"
-                    "• No progressive MP4 streams available\n"
-                    "• Video is not accessible"
-                )
-                return
+            streams = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc()
             
-            # Create inline keyboard with quality options
             keyboard = []
             for stream in streams:
-                size_mb = stream['filesize'] / (1024 * 1024)
-                button_text = f"{stream['resolution']} ({size_mb:.1f} MB)"
-                callback_data = f"download_{stream['itag']}_{update.message.chat.id}"
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-            
+                if stream.filesize and stream.filesize <= MAX_FILE_SIZE:
+                    filesize_mb = round(stream.filesize / (1024 * 1024), 1)
+                    button_text = f"{stream.resolution} ({filesize_mb} MB)"
+                    callback_data = f"download|{yt.video_id}|{stream.itag}"
+                    keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+
+            if not keyboard:
+                await sent_message.edit_text("😕 Maaf kijiye, is video ke liye 50 MB se kam ka koi download option uplabdh nahi hai.")
+                return
+
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            video_info = (
-                f"🎥 *{yt.title}*\n"
-                f"👤 {yt.author}\n"
-                f"⏱️ {self._format_duration(yt.length)}\n\n"
-                f"📱 Choose quality to download:"
+            await sent_message.edit_text(
+                f"<b>Video:</b> {yt.title}\n\n"
+                f"Download karne ke liye quality chunein:",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
             )
-            
-            # Store video URL in context for callback
-            context.user_data[f'video_url_{update.message.chat.id}'] = message_text
-            
-            await processing_msg.edit_text(video_info, parse_mode='Markdown', reply_markup=reply_markup)
-            
+
+        except PytubeExceptions.RegexMatchError:
+             await sent_message.edit_text("❌ Galat YouTube link. Kripya sahi link bhejein.")
         except Exception as e:
-            logger.error(f"Error processing YouTube URL: {e}")
-            await processing_msg.edit_text("❌ An error occurred while processing the video. Please try again.")
-    
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle callback queries from inline buttons."""
-        query = update.callback_query
-        await query.answer()
+            logger.error(f"Link process karne mein error: {e}")
+            await sent_message.edit_text("❌ Ek anjaan error aagaya. Ho sakta hai video private, age-restricted, ya region-locked ho.")
+    else:
+        await update.message.reply_text("Kripya ek aam YouTube video ka link bhejein.")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quality selection button ke click ko handle karta hai."""
+    query = update.callback_query
+    await query.answer()
+
+    file_path = None # File path ko pehle se define kar dein
+    try:
+        action, video_id, itag = query.data.split('|')
         
+        if action == "download":
+            await query.edit_message_text(text="⬇️ Video download ho rahi hai...")
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            yt = YouTube(video_url)
+            stream = yt.streams.get_by_itag(int(itag))
+
+            # /tmp/ folder ka istemal karein jo hosting platforms par aam taur par writable hota hai
+            file_path = stream.download(output_path='/tmp/', filename_prefix=video_id)
+            
+            await query.edit_message_text(text="⬆️ Video upload ho rahi hai...")
+
+            with open(file_path, 'rb') as video_file:
+                await context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=video_file,
+                    caption=f"✅ Done: {yt.title}",
+                    supports_streaming=True,
+                    read_timeout=180, 
+                    write_timeout=180
+                )
+            
+            await query.delete_message()
+
+    except Exception as e:
+        logger.error(f"Button callback mein error: {e}")
         try:
-            # Parse callback data
-            if not query.data.startswith("download_"):
-                return
-            
-            parts = query.data.split("_")
-            if len(parts) != 3:
-                return
-            
-            itag = int(parts[1])
-            chat_id = int(parts[2])
-            
-            # Get stored video URL
-            video_url = context.user_data.get(f'video_url_{chat_id}')
-            if not video_url:
-                await query.edit_message_text("❌ Session expired. Please send the YouTube URL again.")
-                return
-            
-            # Show downloading message
-            await query.edit_message_text("⬬ Downloading video... Please wait.")
-            
-            # Get video and stream
-            yt = self.downloader.get_video_info(video_url)
-            if not yt:
-                await query.edit_message_text("❌ Failed to get video information.")
-                return
-            
-            # Find the selected stream
-            stream = None
-            for s in yt.streams:
-                if s.itag == itag:
-                    stream = s
-                    break
-            
-            if not stream:
-                await query.edit_message_text("❌ Selected quality is no longer available.")
-                return
-            
-            # Create temporary directory
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Download video
-                file_path = self.downloader.download_stream(stream, temp_dir)
-                if not file_path:
-                    await query.edit_message_text("❌ Failed to download video.")
-                    return
-                
-                # Update message
-                await query.edit_message_text("📤 Uploading video...")
-                
-                # Send video file
-                with open(file_path, 'rb') as video_file:
-                    await context.bot.send_video(
-                        chat_id=chat_id,
-                        video=video_file,
-                        caption=f"🎥 {yt.title}\n👤 {yt.author}",
-                        supports_streaming=True
-                    )
+            await query.edit_message_text("❌ Download fail ho gaya. Server par koi samasya hui.")
+        except Exception:
+            pass # Agar message edit na ho sake to ignore karein
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"File saaf kar di gayi: {file_path}")
+
+def main():
+    """Bot aur Web App ko shuru karta hai."""
+    logger.info("Application shuru ho rahi hai...")
+
+    # Flask app ko background mein chalayein
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("Flask server background mein shuru ho gaya hai.")
+
+    # Telegram Bot setup
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler(["start", "help"], start_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    logger.info("Telegram Bot polling shuru kar raha hai...")
+    # Bot ko polling mode mein chalayein
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()                    )
                 
                 # Clean up - file will be automatically deleted when temp_dir exits
                 
