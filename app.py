@@ -1,161 +1,175 @@
+# ========================================================================================
+# === 1. IMPORTS & SETUP =================================================================
+# ========================================================================================
 import os
 import logging
-from threading import Thread
-from flask import Flask
+import asyncio
+from flask import Flask, request
 from pytube import YouTube, exceptions as PytubeExceptions
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
-# === Logging Setup ===
+# ========================================================================================
+# === 2. LOGGING SETUP ===================================================================
+# ========================================================================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# === Configuration ===
-# Yeh environment variable se token padhega.
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-# 50 MB limit in bytes
-MAX_FILE_SIZE = 50 * 1024 * 1024 
+# ========================================================================================
+# === 3. CONFIGURATION & STATE ===========================================================
+# ========================================================================================
+class Config:
+    """Saari application settings ek jagah par."""
+    try:
+        TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+        WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+    except KeyError as e:
+        logger.critical(f"FATAL: Environment variable {e} set nahi hai! App band ho raha hai.")
+        exit()
+        
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+    DOWNLOAD_PATH = '/tmp/' # Hosting platforms ke liye temporary directory
 
-# === Flask Web App (For Uptime) ===
+# ========================================================================================
+# === 4. CORE BOT & WEB APP INITIALIZATION ===============================================
+# ========================================================================================
+bot = Bot(token=Config.TELEGRAM_TOKEN)
+application = Application.builder().bot(bot).build()
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    """Web page to show bot status."""
-    return "<h1>Bot is Alive!</h1><p>The YouTube downloader bot is running.</p>"
+# ========================================================================================
+# === 5. TELEGRAM HELPER FUNCTIONS =======================================================
+# ========================================================================================
+async def download_video_from_yt(video_id: str, itag: int):
+    """YouTube se video download karta hai aur file path return karta hai."""
+    try:
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        yt = YouTube(video_url)
+        stream = yt.streams.get_by_itag(itag)
+        
+        logger.info(f"Downloading '{yt.title}' with itag {itag}")
+        # Ek unique naam se file download karein
+        file_path = stream.download(output_path=Config.DOWNLOAD_PATH, filename_prefix=f"{video_id}_{itag}_")
+        return file_path, yt.title
+    except Exception as e:
+        logger.error(f"Download helper mein error: {e}")
+        return None, None
 
-@app.route('/ping')
-def ping():
-    """Endpoint for UptimeRobot."""
-    return "pong"
+def cleanup_file(file_path: str):
+    """Server se file delete karta hai."""
+    if file_path and os.path.exists(file_path):
+        os.remove(file_path)
+        logger.info(f"File saaf kar di gayi: {file_path}")
 
-def run_flask():
-    """Runs the Flask app in a separate thread."""
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-# === Telegram Bot Logic ===
-
+# ========================================================================================
+# === 6. TELEGRAM COMMAND & MESSAGE HANDLERS =============================================
+# ========================================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /start command."""
     user = update.effective_user
     welcome_text = (
         f"Salaam, {user.mention_html()}!\n\n"
-        "I am a YouTube Downloader Bot. Send me any YouTube video link.\n\n"
-        "<b>Note:</b> I can only send video files smaller than 50 MB."
+        "Main ek advanced YouTube Downloader Bot hoon. Muje koi bhi YouTube video ka link bhejein.\n\n"
+        f"<b>Note:</b> Main sirf {Config.MAX_FILE_SIZE // (1024*1024)} MB se choti files hi bhej sakta hoon."
     )
     await update.message.reply_html(welcome_text)
 
 async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes YouTube links."""
     message_text = update.message.text
-    if "youtube.com/" in message_text or "youtu.be/" in message_text:
-        sent_message = await update.message.reply_text("⏳ Processing link, please wait...")
+    if "youtube.com/" not in message_text and "youtu.be/" not in message_text:
+        return await update.message.reply_text("Kripya ek aam YouTube video ka link bhejein.")
         
-        try:
-            yt = YouTube(message_text)
-            
-            streams = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc()
-            
-            keyboard = []
-            for stream in streams:
-                if stream.filesize and stream.filesize <= MAX_FILE_SIZE:
-                    filesize_mb = round(stream.filesize / (1024 * 1024), 1)
-                    button_text = f"{stream.resolution} ({filesize_mb} MB)"
-                    callback_data = f"download|{yt.video_id}|{stream.itag}"
-                    keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+    sent_message = await update.message.reply_text("⏳ Link process ho raha hai...")
+    try:
+        yt = YouTube(message_text)
+        streams = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc()
+        
+        keyboard = []
+        for stream in streams:
+            if stream.filesize and stream.filesize <= Config.MAX_FILE_SIZE:
+                filesize_mb = round(stream.filesize / (1024 * 1024), 1)
+                button_text = f"{stream.resolution} ({filesize_mb} MB)"
+                callback_data = f"download|{yt.video_id}|{stream.itag}"
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
 
-            if not keyboard:
-                await sent_message.edit_text("😕 Sorry, no download options under 50 MB found for this video.")
-                return
+        if not keyboard:
+            return await sent_message.edit_text("😕 Maaf kijiye, 50 MB se kam ka koi option nahi mila.")
 
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await sent_message.edit_text(
-                f"<b>Video:</b> {yt.title}\n\n"
-                f"Select a quality to download:",
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.HTML
-            )
-
-        except PytubeExceptions.RegexMatchError:
-             await sent_message.edit_text("❌ Invalid YouTube link. Please send a valid one.")
-        except Exception as e:
-            logger.error(f"Error processing link: {e}")
-            await sent_message.edit_text("❌ An unknown error occurred. The video might be private, age-restricted, or region-locked.")
-    else:
-        await update.message.reply_text("Please send a standard YouTube video link.")
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await sent_message.edit_text(
+            f"<b>Video:</b> {yt.title}\n\nDownload karne ke liye quality chunein:",
+            reply_markup=reply_markup, parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Link process karne mein error: {e}")
+        await sent_message.edit_text("❌ Error: Video private ya unavailable ho sakti hai.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles button clicks for quality selection."""
     query = update.callback_query
     await query.answer()
-
+    
     file_path = None
     try:
-        action, video_id, itag = query.data.split('|')
-        
+        action, video_id, itag_str = query.data.split('|')
+        itag = int(itag_str)
+
         if action == "download":
             await query.edit_message_text(text="⬇️ Downloading video...")
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-            yt = YouTube(video_url)
-            stream = yt.streams.get_by_itag(int(itag))
-            
-            # Use /tmp/ directory which is usually writable on hosting platforms
-            file_path = stream.download(output_path='/tmp/', filename_prefix=video_id)
-            
-            await query.edit_message_text(text="⬆️ Uploading video...")
+            file_path, video_title = await download_video_from_yt(video_id, itag)
 
+            if not file_path:
+                return await query.edit_message_text("❌ Download fail ho gaya.")
+
+            await query.edit_message_text(text="⬆️ Uploading video...")
             with open(file_path, 'rb') as video_file:
                 await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=video_file,
-                    caption=f"✅ Done: {yt.title}",
-                    supports_streaming=True,
-                    read_timeout=180, 
-                    write_timeout=180
+                    chat_id=query.message.chat_id, video=video_file,
+                    caption=f"✅ Done: {video_title}", supports_streaming=True
                 )
-            
             await query.delete_message()
-
     except Exception as e:
-        logger.error(f"Error in button callback: {e}")
+        logger.error(f"Button callback mein error: {e}")
         try:
-            await query.edit_message_text("❌ Download failed. There was a server-side issue.")
-        except Exception:
-            pass
+            await query.edit_message_text("❌ Ek anjaan samasya hui.")
+        except: pass
     finally:
-        # Clean up the downloaded file
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up file: {file_path}")
+        cleanup_file(file_path)
 
-def main():
-    """Starts the bot and the web app."""
-    if not TELEGRAM_TOKEN:
-        logger.critical("FATAL ERROR: TELEGRAM_BOT_TOKEN environment variable is not set!")
-        return
+# ========================================================================================
+# === 7. WEB APP (FLASK) ROUTES ==========================================================
+# ========================================================================================
+@app.route(f"/{Config.TELEGRAM_TOKEN}", methods=["POST"])
+async def webhook():
+    """Telegram se aane wale updates ko handle karta hai"""
+    update = Update.de_json(request.get_json(force=True), bot)
+    await application.process_update(update)
+    return "ok"
 
-    logger.info("Starting application...")
+@app.route("/set_webhook", methods=['GET', 'POST'])
+def set_webhook():
+    """Webhook ko set/reset karta hai (sirf ek baar run karna hota hai)"""
+    webhook_url = f"{Config.WEBHOOK_URL}/{Config.TELEGRAM_TOKEN}"
+    was_set = asyncio.run(bot.set_webhook(url=webhook_url))
+    return f"Webhook set to {webhook_url}: {was_set}"
 
-    # Run Flask app in a background thread
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    logger.info("Flask server started in a background thread.")
+@app.route("/")
+def index():
+    """Bot ka status dikhane ke liye main page"""
+    return "<h1>Bot is alive and well, using a professional structure!</h1>"
 
-    # Set up Telegram Bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler(["start", "help"], start_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    
-    logger.info("Starting Telegram Bot polling...")
-    application.run_polling()
+# ========================================================================================
+# === 8. MAIN EXECUTION BLOCK ============================================================
+# ========================================================================================
+# Handlers ko Application mein add karein
+application.add_handler(CommandHandler(["start", "help"], start_command))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
+application.add_handler(CallbackQueryHandler(button_handler))
 
-# This is the standard way to run a Python script.
-if __name__ == '__main__':
-    main()
+# Agar yeh file seedhe run ki ja rahi hai, to development server chalao.
+# Render par yeh gunicorn se chalega, to yeh block wahan execute nahi hoga.
+if __name__ == "__main__":
+    logging.info("--- Starting Flask Server for Local Development ---")
+    app.run(host='0.0.0.0', port=8080, debug=True)
