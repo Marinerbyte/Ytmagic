@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========================================================================================
-# === 3. CONFIGURATION & STATE ===========================================================
+# === 3. CONFIGURATION ===================================================================
 # ========================================================================================
 class Config:
     """Saari application settings ek jagah par."""
@@ -39,7 +39,7 @@ class Config:
 # ========================================================================================
 bot = Bot(token=Config.TELEGRAM_TOKEN)
 application = Application.builder().bot(bot).build()
-app = Flask(__name__)
+app = Flask(__name__) # Yeh 'app' gunicorn ke liye zaroori hai
 
 # ========================================================================================
 # === 5. TELEGRAM HELPER FUNCTIONS =======================================================
@@ -50,9 +50,7 @@ async def download_video_from_yt(video_id: str, itag: int):
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         yt = YouTube(video_url)
         stream = yt.streams.get_by_itag(itag)
-        
         logger.info(f"Downloading '{yt.title}' with itag {itag}")
-        # Ek unique naam se file download karein
         file_path = stream.download(output_path=Config.DOWNLOAD_PATH, filename_prefix=f"{video_id}_{itag}_")
         return file_path, yt.title
     except Exception as e:
@@ -70,12 +68,10 @@ def cleanup_file(file_path: str):
 # ========================================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    welcome_text = (
+    await update.message.reply_html(
         f"Salaam, {user.mention_html()}!\n\n"
-        "Main ek advanced YouTube Downloader Bot hoon. Muje koi bhi YouTube video ka link bhejein.\n\n"
-        f"<b>Note:</b> Main sirf {Config.MAX_FILE_SIZE // (1024*1024)} MB se choti files hi bhej sakta hoon."
+        "Main ek YouTube Downloader Bot hoon. Muje koi bhi YouTube video ka link bhejein."
     )
-    await update.message.reply_html(welcome_text)
 
 async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text
@@ -141,35 +137,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========================================================================================
 # === 7. WEB APP (FLASK) ROUTES ==========================================================
 # ========================================================================================
-@app.route(f"/{Config.TELEGRAM_TOKEN}", methods=["POST"])
-async def webhook():
-    """Telegram se aane wale updates ko handle karta hai"""
-    update = Update.de_json(request.get_json(force=True), bot)
-    await application.process_update(update)
-    return "ok"
 
-@app.route("/set_webhook", methods=['GET', 'POST'])
-def set_webhook():
-    """Webhook ko set/reset karta hai (sirf ek baar run karna hota hai)"""
-    webhook_url = f"{Config.WEBHOOK_URL}/{Config.TELEGRAM_TOKEN}"
-    was_set = asyncio.run(bot.set_webhook(url=webhook_url))
-    return f"Webhook set to {webhook_url}: {was_set}"
-
-@app.route("/")
-def index():
-    """Bot ka status dikhane ke liye main page"""
-    return "<h1>Bot is alive and well, using a professional structure!</h1>"
-
-# ========================================================================================
-# === 8. MAIN EXECUTION BLOCK ============================================================
-# ========================================================================================
 # Handlers ko Application mein add karein
 application.add_handler(CommandHandler(["start", "help"], start_command))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
 application.add_handler(CallbackQueryHandler(button_handler))
 
-# Agar yeh file seedhe run ki ja rahi hai, to development server chalao.
-# Render par yeh gunicorn se chalega, to yeh block wahan execute nahi hoga.
-if __name__ == "__main__":
-    logging.info("--- Starting Flask Server for Local Development ---")
-    app.run(host='0.0.0.0', port=8080, debug=True)
+# Yeh route Telegram se aane wale updates ko handle karega
+@app.route(f"/{Config.TELEGRAM_TOKEN}", methods=["POST"])
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    await application.process_update(update)
+    return "ok"
+
+# *** YAHAN PAR GALTI THEEK KI GAYI HAI ***
+# Ek route webhook ko set karne ke liye (sirf ek baar run karna hai)
+@app.route("/set_webhook", methods=['GET', 'POST'])
+def set_webhook():
+    # Sahi URL banayein
+    webhook_url_to_set = f"{Config.WEBHOOK_URL}/{Config.TELEGRAM_TOKEN}"
+    
+    # Webhook set karein
+    was_set = asyncio.run(bot.set_webhook(url=webhook_url_to_set))
+    
+    if was_set:
+        return f"Webhook set to {webhook_url_to_set}: {was_set}"
+    else:
+        return f"Webhook setup failed for {webhook_url_to_set}"
+
+@app.route("/")
+def index():
+    return "<h1>Bot is alive!</h1>"
